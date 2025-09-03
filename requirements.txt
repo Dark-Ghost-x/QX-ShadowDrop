@@ -1,0 +1,17 @@
+# HTTP Requests
+requests
+urllib3
+
+# HTML Parsing
+beautifulsoup4
+lxml
+
+# Input Validation
+validators
+
+# Terminal & Color Output
+colorama
+rich
+tqdm
+
+

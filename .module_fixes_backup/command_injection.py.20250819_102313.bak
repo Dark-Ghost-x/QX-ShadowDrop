@@ -1,0 +1,342 @@
+from core import modules_base
+#!/usr/bin/env python3
+import json
+import random
+import time
+from copy import deepcopy
+from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
+from typing import Dict, List, Union, Optional, Tuple, Any
+
+import requests
+import settings
+from core.modules.vulnerability_base import Scanner
+
+ERROR_SIGNATURES = {
+    "unix": ["sh: 1:", "/bin/sh:", "bash:", "zsh:", "fish:", "syntax error", 
+             "unexpected token", "cannot execute", "permission denied",
+             "no such file or directory"],
+    "windows": ["is not recognized as an internal or external command",
+                "the system cannot find the path specified", "cmd.exe", 
+                "powershell", "term not recognized"]
+}
+
+SENSITIVE_PARAMS = ["cmd", "exec", "query", "search", "id", "file", "path", "dir", "action"]
+
+COMMAND_SEPARATORS = {
+    "unix": [";", "&&", "|", "`", "$(", ");", "&&'", "&&\"", "|'", "|\"", "';'", "\";\""],
+    "windows": ["&", "|", "%26"]
+}
+
+PAYLOAD_TEMPLATES = {
+    "echo": {
+        "unix": ["&& echo QXSD", "; echo QXSD", "| echo QXSD", "&& printf QXSD"],
+        "windows": ["& echo QXSD"]
+    },
+    "time": {
+        "unix": ["&& sleep 4", "; sleep 4", "| sleep 4"],
+        "windows": ["& timeout /T 4", "& ping -n 4 127.0.0.1>nul"]
+    }
+}
+
+DEFAULT_POST_PARAMS = ["cmd", "q", "query", "search", "id"]
+
+class Scanner(modules_base.Scanner):
+    name = "command_injection"
+    useproxy = getattr(settings, "USEPROXY", True)
+    enabled = True
+    max_tests = 36
+    baseline_samples = 3
+    delay_range = (0.12, 0.32)
+    time_threshold = 2.8
+
+    @property
+    def user_agent(self) -> str:
+        return getattr(settings, "USERAGENT", getattr(settings, "USER_AGENT", "QX-Scanner"))
+
+    def _headers(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        headers = {
+            "User-Agent": self.user_agent,
+            "X-Scanner": "QX-ShadowDrop",
+            "Accept": "*/*",
+            "Connection": "keep-alive"
+        }
+        if extra:
+            headers.update(extra)
+        return headers
+
+    def _sorted_params(self, params: List[str]) -> List[str]:
+        return sorted(params, key=lambda p: 0 if p.lower() in SENSITIVE_PARAMS else 1)
+
+    def _generate_payloads(self, base_value: str, payload_type: str) -> List[str]:
+        payloads = []
+        systems = ["unix", "windows"] if self.aggressive else ["unix"]
+        
+        for system in systems:
+            if payload_type == "error":
+                for sep in COMMAND_SEPARATORS[system]:
+                    payloads.append(f"{base_value}{sep}")
+            elif payload_type in PAYLOAD_TEMPLATES:
+                for template in PAYLOAD_TEMPLATES[payload_type][system]:
+                    payloads.append(f"{base_value}{template}")
+        
+        return payloads
+
+    def _build_query_tests(self, url: str) -> List[Dict[str, Any]]:
+        parsed = urlparse(url)
+        query_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        tests = []
+        
+        if not query_params:
+            base_url = url.rstrip("/")
+            for payload in self._generate_payloads("1", "error"):
+                tests.append({
+                    "method": "GET",
+                    "url": f"{base_url}?cmd={payload}",
+                    "vector": "query",
+                    "param": "cmd",
+                    "kind": "error"
+                })
+            return tests
+
+        for param in self._sorted_params(list(query_params.keys()))[:3]:
+            base_value = query_params.get(param) or "1"
+            
+            for payload in self._generate_payloads(base_value, "error"):
+                new_query = deepcopy(query_params)
+                new_query[param] = payload
+                new_url = parsed._replace(query=urlencode(new_query, doseq=True))
+                tests.append({
+                    "method": "GET",
+                    "url": urlunparse(new_url),
+                    "vector": "query",
+                    "param": param,
+                    "kind": "error"
+                })
+            
+            for payload in self._generate_payloads(base_value, "echo"):
+                new_query = deepcopy(query_params)
+                new_query[param] = payload
+                new_url = parsed._replace(query=urlencode(new_query, doseq=True))
+                tests.append({
+                    "method": "GET",
+                    "url": urlunparse(new_url),
+                    "vector": "query",
+                    "param": param,
+                    "kind": "echo"
+                })
+            
+            if self.aggressive:
+                for payload in self._generate_payloads(base_value, "time"):
+                    new_query = deepcopy(query_params)
+                    new_query[param] = payload
+                    new_url = parsed._replace(query=urlencode(new_query, doseq=True))
+                    tests.append({
+                        "method": "GET",
+                        "url": urlunparse(new_url),
+                        "vector": "query",
+                        "param": param,
+                        "kind": "time"
+                    })
+        
+        return tests
+
+    def _build_body_tests(self, url: str, content_type: str) -> List[Dict[str, Any]]:
+        tests = []
+        data_key = "json" if content_type == "application/json" else "data"
+        
+        for param in DEFAULT_POST_PARAMS[:3]:
+            for payload in self._generate_payloads("1", "error"):
+                tests.append({
+                    "method": "POST",
+                    "url": url,
+                    "vector": f"body_{content_type.split('/')[-1]}",
+                    "param": param,
+                    "kind": "error",
+                    data_key: {param: payload},
+                    "headers": {"Content-Type": content_type}
+                })
+            
+            for payload in self._generate_payloads("1", "echo"):
+                tests.append({
+                    "method": "POST",
+                    "url": url,
+                    "vector": f"body_{content_type.split('/')[-1]}",
+                    "param": param,
+                    "kind": "echo",
+                    data_key: {param: payload},
+                    "headers": {"Content-Type": content_type}
+                })
+            
+            if self.aggressive:
+                for payload in self._generate_payloads("1", "time"):
+                    tests.append({
+                        "method": "POST",
+                        "url": url,
+                        "vector": f"body_{content_type.split('/')[-1]}",
+                        "param": param,
+                        "kind": "time",
+                        data_key: {param: payload},
+                        "headers": {"Content-Type": content_type}
+                    })
+        
+        return tests
+
+    def _build_tests(self, target: str, method: str) -> List[Dict[str, Any]]:
+        method = method.upper()
+        tests = []
+        
+        if method in ("GET", "AUTO"):
+            tests.extend(self._build_query_tests(target))
+        
+        if method in ("POST", "AUTO"):
+            tests.extend(self._build_body_tests(target, "application/x-www-form-urlencoded"))
+            tests.extend(self._build_body_tests(target, "application/json"))
+        
+        unique_tests = []
+        seen = set()
+        
+        for test in tests:
+            test_key = (test["method"], test["url"], test["vector"], test.get("param"), test["kind"])
+            if test_key not in seen:
+                seen.add(test_key)
+                unique_tests.append(test)
+        
+        return unique_tests[:self.max_tests]
+
+    def _execute_request(self, method: str, url: str, headers: Dict[str, str], 
+                        data: Optional[Dict] = None, json_body: Optional[Dict] = None,
+                        timeout: int = 10) -> requests.Response:
+        session = self.session if self.useproxy else requests.Session()
+        
+        try:
+            if method == "GET":
+                return session.get(url, headers=headers, timeout=timeout, allow_redirects=False)
+            return session.post(url, headers=headers, data=data, json=json_body, 
+                               timeout=timeout, allow_redirects=False)
+        except (requests.RequestException, OSError) as e:
+            if self.useproxy:
+                return self._execute_request(method, url, headers, data, json_body, timeout)
+            raise
+
+    def _calculate_baseline(self, url: str, timeout: int) -> float:
+        latencies = []
+        
+        for _ in range(self.baseline_samples):
+            try:
+                start_time = time.time()
+                self._execute_request("GET", url, self._headers(), timeout=timeout)
+                latencies.append(time.time() - start_time)
+            except Exception:
+                latencies.append(1.0)
+        
+        latencies.sort()
+        median = latencies[len(latencies) // 2]
+        return max(0.2, min(median, 5.0))
+
+    def _process_test(self, test: Dict, baseline: Optional[float], timeout: int) -> Dict[str, Any]:
+        time.sleep(random.uniform(*self.delay_range))
+        
+        try:
+            headers = self._headers(test.get("headers", {}))
+            request_timeout = max(timeout, 12) if test["kind"] == "time" else timeout
+            
+            start_time = time.time()
+            response = self._execute_request(
+                test["method"],
+                test["url"],
+                headers,
+                data=test.get("data"),
+                json_body=test.get("json"),
+                timeout=request_timeout
+            )
+            elapsed = time.time() - start_time
+            
+            response_text = (response.text or "").lower()
+            
+            result = {
+                "tested_url": test["url"],
+                "method": test["method"],
+                "vector": test["vector"],
+                "param": test.get("param"),
+                "kind": test["kind"],
+                "status_code": response.status_code
+            }
+            
+            if test["kind"] in ("error", "echo"):
+                result["match_error"] = any(
+                    sig in response_text for sig in 
+                    ERROR_SIGNATURES["unix"] + ERROR_SIGNATURES["windows"]
+                )
+                
+                if test["kind"] == "echo":
+                    result["match_echo"] = "qxsd" in response_text
+            
+            if test["kind"] == "time" and baseline:
+                time_delay = elapsed - baseline
+                if time_delay > self.time_threshold:
+                    confirm_start = time.time()
+                    self._execute_request(
+                        test["method"],
+                        test["url"],
+                        headers,
+                        data=test.get("data"),
+                        json_body=test.get("json"),
+                        timeout=request_timeout
+                    )
+                    confirm_delay = time.time() - confirm_start - baseline
+                    result["blind_delay"] = confirm_delay > 2.5
+            
+            return result
+        
+        except Exception as e:
+            return {
+                "tested_url": test["url"],
+                "method": test["method"],
+                "vector": test["vector"],
+                "param": test.get("param"),
+                "kind": test["kind"],
+                "error": str(e)
+            }
+
+    def scan(self) -> Dict[str, Any]:
+        self.session.headers.update(self._headers())
+        
+        scan_config = {
+            "timeout": getattr(settings, "TIMEOUT", 10),
+            "method": getattr(settings, "METHOD", "AUTO").upper(),
+            "target": self.target
+        }
+        
+        tests = self._build_tests(scan_config["target"], scan_config["method"])
+        baseline = None
+        
+        if any(test["kind"] == "time" for test in tests):
+            baseline = self._calculate_baseline(
+                scan_config["target"],
+                min(scan_config["timeout"], 8)
+            )
+        
+        evidence = []
+        for test in tests:
+            evidence.append(self._process_test(test, baseline, scan_config["timeout"]))
+        
+        direct_hits = any(
+            evidence.get("match_error", False) or evidence.get("match_echo", False)
+            for evidence in evidence
+        )
+        
+        blind_hits = any(
+            evidence.get("blind_delay", False)
+            for evidence in evidence
+        )
+        
+        risk_level = "high" if direct_hits else "medium" if blind_hits else "low"
+        
+        return {
+            "ok": True,
+            "risk": risk_level,
+            "evidence": evidence,
+            "config": scan_config,
+            "baseline_latency": baseline,
+            "notes": "Comprehensive command injection testing with error, echo, and time-based detection"
+        }

@@ -1,0 +1,117 @@
+from core import modules_base
+#!/usr/bin/env python3
+import requests
+from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
+from typing import List, Dict, Any, Optional, Set
+import settings
+from core.modules.vulnerability_base import Scanner
+
+class Scanner(modules_base.Scanner):
+    name: str = "remote_file_inclusion_probe"
+    useproxy: bool = getattr(settings, "USEPROXY", True)
+    enabled: bool = True
+    timeout: int = getattr(settings, "TIMEOUT", 8)
+    user_agent: str = getattr(settings, "USERAGENT", "QX-Scanner")
+    max_tests: int = 15
+
+    TEST_FILES: Dict[str, str] = {
+        "github_readme": "https://raw.githubusercontent.com/github/gitignore/main/README.md",
+        "simple_text": "https://www.gutenberg.org/files/1342/1342-0.txt",
+        "small_file": "https://example.com/index.html"
+    }
+
+    RFI_PARAMS: Set[str] = {
+        "file", "page", "path", "template", "inc", "include",
+        "load", "url", "doc", "document", "view", "content"
+    }
+
+    INDICATORS: Dict[str, str] = {
+        "github_readme": "a collection of useful .gitignore templates",
+        "simple_text": "project gutenberg",
+        "small_file": "example domain"
+    }
+
+    def __init__(self, target, config, report_dir, **kwargs):
+        self.session = requests.Session()
+        super().__init__(target, config, report_dir, **kwargs)
+        self.session.headers.update({"User-Agent": self.user_agent})
+
+    def _generate_test_cases(self) -> List[Dict[str, str]]:
+        parsed = urlparse(self.target)
+        queries = dict(parse_qsl(parsed.query))
+        test_cases = []
+
+        if queries:
+            for param in queries:
+                if param.lower() in self.RFI_PARAMS:
+                    for name, url in self.TEST_FILES.items():
+                        new_query = queries.copy()
+                        new_query[param] = url
+                        test_url = parsed._replace(query=urlencode(new_query, doseq=True))
+                        test_cases.append({
+                            "url": urlunparse(test_url),
+                            "param": param,
+                            "test_file": name,
+                            "test_url": url
+                        })
+                        if len(test_cases) >= self.max_tests:
+                            return test_cases
+        else:
+            for param in self.RFI_PARAMS:
+                for name, url in self.TEST_FILES.items():
+                    base_url = self.target.rstrip("/")
+                    test_cases.append({
+                        "url": f"{base_url}?{param}={url}",
+                        "param": param,
+                        "test_file": name,
+                        "test_url": url
+                    })
+                    if len(test_cases) >= self.max_tests:
+                        return test_cases
+
+        return test_cases[:self.max_tests]
+
+    def _execute_test(self, test_case: Dict[str, str]) -> Dict[str, Any]:
+        try:
+            response = self.session.get(
+                test_case["url"],
+                timeout=self.timeout,
+                allow_redirects=False,
+                proxies=getattr(self, "proxies", None)
+            )
+
+            content = response.text.lower()
+            expected_content = self.INDICATORS[test_case["test_file"]].lower()
+            vulnerable = expected_content in content
+
+            return {
+                **test_case,
+                "status_code": response.status_code,
+                "content_length": len(response.content),
+                "vulnerable": vulnerable,
+                "matched_content": vulnerable
+            }
+
+        except requests.RequestException as e:
+            return {**test_case, "error": str(e)}
+
+    def scan(self) -> Dict[str, Any]:
+        test_cases = self._generate_test_cases()
+        results = [self._execute_test(case) for case in test_cases]
+        
+        vulnerable = any(result.get("vulnerable") for result in results)
+        
+        return {
+            "ok": True,
+            "risk": "high" if vulnerable else "low",
+            "evidence": results,
+            "stats": {
+                "tested_urls": len(results),
+                "vulnerable_cases": sum(1 for r in results if r.get("vulnerable")),
+                "test_files_used": list({r["test_file"] for r in results})
+            },
+            "notes": "Comprehensive RFI vulnerability scan with multiple test files"
+        }
+
+    def run(self) -> Dict[str, Any]:
+        return self.scan()

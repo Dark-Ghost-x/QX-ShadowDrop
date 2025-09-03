@@ -1,0 +1,87 @@
+from core import modules_base
+#!/usr/bin/env python3
+import re
+from typing import Dict, Any, List, Optional, Tuple
+import requests
+from core.modules.vulnerability_base import Scanner
+from config import settings
+
+class Scanner(modules_base.Scanner):
+    name: str = "clickjacking"
+    description: str = "Clickjacking protection via X-Frame-Options/CSP frame-ancestors"
+    risk: str = "low"
+    enabled: bool = True
+    timeout: int = getattr(settings, "TIMEOUT", 10)
+    user_agent: str = getattr(settings, "USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+    def _is_html_response(self, response: requests.Response) -> bool:
+        content_type = response.headers.get("Content-Type", "").lower()
+        return "text/html" in content_type
+
+    def _get_secure_headers(self, headers: Dict[str, str]) -> Tuple[bool, List[str], Optional[str]]:
+        secure = False
+        reasons = []
+        frame_ancestors = None
+
+        x_frame_options = headers.get("x-frame-options", "").lower()
+        if x_frame_options in ("deny", "sameorigin"):
+            secure = True
+            reasons.append(f"X-Frame-Options: {x_frame_options}")
+
+        csp = headers.get("content-security-policy", "").lower()
+        if "frame-ancestors" in csp:
+            match = re.search(r"frame-ancestors\s+([^;]+)", csp)
+            if match:
+                frame_ancestors = match.group(1).strip().strip("'")
+                if frame_ancestors.lower() != "*":
+                    secure = True
+                    reasons.append(f"CSP frame-ancestors: {frame_ancestors}")
+
+        return secure, reasons, frame_ancestors
+
+    def _get_response(self) -> Optional[requests.Response]:
+        try:
+            if "User-Agent" not in self.session.headers:
+                self.session.headers.update({"User-Agent": self.user_agent})
+
+            proxies = getattr(self.session, "proxies", None) if getattr(settings, "USE_PROXY", False) else None
+            return self.session.get(
+                self.target,
+                timeout=self.timeout,
+                allow_redirects=True,
+                proxies=proxies
+            )
+        except (requests.RequestException, ValueError):
+            return None
+
+    def scan(self) -> Dict[str, Any]:
+        response = self._get_response()
+        if not response:
+            return {"ok": False, "risk": "low", "evidence": [], "notes": "Request failed"}
+
+        headers = {k.lower(): v for k, v in response.headers.items()}
+        is_html = self._is_html_response(response)
+        secure, reasons, frame_ancestors = self._get_secure_headers(headers)
+
+        risk = "low" if secure else ("high" if is_html else "medium")
+        if not reasons:
+            reasons = ["No clickjacking protection headers detected"]
+
+        evidence = {
+            "secure": secure,
+            "reasons": reasons,
+            "x_frame_options": headers.get("x-frame-options"),
+            "csp_frame_ancestors": frame_ancestors,
+            "is_html": is_html,
+            "status_code": response.status_code
+        }
+
+        return {
+            "ok": True,
+            "risk": risk,
+            "evidence": evidence,
+            "notes": "Clickjacking vulnerability assessment"
+        }
+
+    def run(self) -> Dict[str, Any]:
+        return self.scan()

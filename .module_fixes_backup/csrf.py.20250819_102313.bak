@@ -1,0 +1,153 @@
+from core import modules_base
+#!/usr/bin/env python3
+import re
+from typing import Dict, Any, List, Optional, Set, Match
+import requests
+from core.modules.vulnerability_base import Scanner
+from config import settings
+
+FORM_RE = re.compile(r"<form\b(?P<attrs>[^>]*)>(?P<body>.*?)</form>", re.IGNORECASE | re.DOTALL)
+TOKEN_INPUT_RE = re.compile(
+    r"<input\b[^>]*\b(?:name|id)\s*=\s*['\"](?:csrf[_-]?token|_token|authenticity_token|__requestverificationtoken|_csrf|csrfmiddlewaretoken)['\"][^>]*>",
+    re.IGNORECASE
+)
+META_CSRF_RE = re.compile(
+    r"<meta\b[^>]*\bname\s*=\s*['\"](?:csrf[_-]token|csrf_token|_csrf)['\"][^>]*>",
+    re.IGNORECASE
+)
+
+class Scanner(modules_base.Scanner):
+    name: str = "csrf_token_check"
+    description: str = "CSRF token presence in forms, meta tags, and cookies"
+    risk: str = "low"
+    enabled: bool = True
+    timeout: int = getattr(settings, "TIMEOUT", 10)
+    user_agent: str = getattr(settings, "USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+    CSRF_COOKIE_NAMES: Set[str] = {
+        "csrftoken", "xsrf-token", "csrf-token", "x-csrf-token",
+        "__requestverificationtoken", "antiforgery", "_csrf", "_xsrf"
+    }
+
+    def _get_response(self) -> Optional[requests.Response]:
+        try:
+            if "User-Agent" not in self.session.headers:
+                self.session.headers.update({"User-Agent": self.user_agent})
+
+            proxies = getattr(self.session, "proxies", None) if getattr(settings, "USE_PROXY", False) else None
+            return self.session.get(
+                self.target,
+                timeout=self.timeout,
+                allow_redirects=True,
+                proxies=proxies
+            )
+        except requests.RequestException:
+            return None
+
+    def _analyze_forms(self, text: str) -> Dict[str, Any]:
+        forms = list(FORM_RE.finditer(text))
+        analysis = {
+            "forms_total": len(forms),
+            "post_forms": 0,
+            "post_forms_with_token": 0,
+            "post_forms_without_token": 0,
+            "reasons": []
+        }
+
+        for form in forms:
+            attrs = form.group("attrs") or ""
+            body = form.group("body") or ""
+            method = self._get_form_method(attrs)
+            action = self._get_form_action(attrs)
+            has_token = bool(TOKEN_INPUT_RE.search(body))
+
+            if method == "post":
+                analysis["post_forms"] += 1
+                if has_token:
+                    analysis["post_forms_with_token"] += 1
+                    analysis["reasons"].append(f"token_in_post_form action={action}")
+                else:
+                    analysis["post_forms_without_token"] += 1
+                    analysis["reasons"].append(f"missing_token_in_post_form action={action}")
+            elif has_token:
+                analysis["reasons"].append(f"token_in_{method}_form action={action}")
+
+        return analysis
+
+    def _get_form_method(self, attrs: str) -> str:
+        method_match = re.search(r"\bmethod\s*=\s*['\"]([^'\"]*)['\"]", attrs, re.IGNORECASE)
+        return (method_match.group(1).lower() if method_match else "get").strip()
+
+    def _get_form_action(self, attrs: str) -> str:
+        action_match = re.search(r"\baction\s*=\s*['\"]([^'\"]*)['\"]", attrs, re.IGNORECASE)
+        return (action_match.group(1) if action_match else "/").strip()
+
+    def _check_csrf_meta(self, text: str) -> bool:
+        return bool(META_CSRF_RE.search(text))
+
+    def _check_csrf_cookies(self, response: requests.Response) -> bool:
+        cookie_keys = {k.lower() for k in response.cookies.keys()}
+        session_cookies = {k.lower() for k in self.session.cookies.keys()}
+        header_cookies = response.headers.get("Set-Cookie", "").lower()
+
+        return any(
+            cookie_name in cookie_keys.union(session_cookies) or cookie_name in header_cookies
+            for cookie_name in self.CSRF_COOKIE_NAMES
+        )
+
+    def _determine_risk(self, analysis: Dict[str, Any], meta_found: bool, cookies_found: bool) -> str:
+        token_found = any([
+            analysis["post_forms_with_token"] > 0,
+            meta_found,
+            cookies_found
+        ])
+
+        if analysis["forms_total"] == 0:
+            return "low" if token_found else "medium"
+        
+        if analysis["post_forms_without_token"] > 0:
+            return "high"
+        if analysis["post_forms"] > 0 and analysis["post_forms_with_token"] == analysis["post_forms"]:
+            return "low"
+        if analysis["post_forms"] == 0 and not token_found:
+            return "medium"
+        
+        return "medium"
+
+    def scan(self) -> Dict[str, Any]:
+        response = self._get_response()
+        if not response:
+            return {"ok": False, "risk": "low", "evidence": [], "notes": "Request failed"}
+
+        text = response.text
+        form_analysis = self._analyze_forms(text)
+        meta_found = self._check_csrf_meta(text)
+        cookies_found = self._check_csrf_cookies(response)
+
+        if meta_found:
+            form_analysis["reasons"].append("meta_csrf_token_present")
+        if cookies_found:
+            form_analysis["reasons"].append("csrf_cookie_present")
+
+        risk = self._determine_risk(form_analysis, meta_found, cookies_found)
+
+        evidence = {
+            "token_found": any([
+                form_analysis["post_forms_with_token"] > 0,
+                meta_found,
+                cookies_found
+            ]),
+            **form_analysis,
+            "csrf_meta_found": meta_found,
+            "csrf_cookies_found": cookies_found
+        }
+
+        return {
+            "ok": True,
+            "risk": risk,
+            "evidence": evidence,
+            "notes": "CSRF protection analysis"
+        }
+
+    def run(self) -> Dict[str, Any]:
+        return self.scan()

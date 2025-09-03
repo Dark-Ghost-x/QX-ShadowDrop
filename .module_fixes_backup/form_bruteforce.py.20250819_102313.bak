@@ -1,0 +1,54 @@
+from core import modules_base
+#!/usr/bin/env python3
+import requests
+from typing import Optional, Dict, Any, List
+from bs4 import BeautifulSoup
+import settings
+from core.modules.vulnerability_base import Scanner
+
+class Scanner(modules_base.Scanner):
+    name = "form_bruteforce"
+    description = "Detect login forms; brute-force disabled by default for ethical reasons"
+    risk = "low"
+    useproxy = getattr(settings, "USEPROXY", False)
+    enabled = False
+
+    def scan(self) -> Dict[str, Any]:
+        self.session.headers.update({"User-Agent": getattr(settings, "USERAGENT", "QX-Scanner")})
+        try:
+            if self.proxy and self.useproxy:
+                try:
+                    r = self.session.get(self.target, timeout=getattr(settings, "TIMEOUT", 8), proxies=self.session.proxies)
+                except (requests.ProxyError, requests.ConnectTimeout, requests.ReadTimeout, requests.SSLError, requests.ConnectionError, OSError):
+                    t = requests.Session()
+                    t.headers.update(self.session.headers)
+                    r = t.get(self.target, timeout=getattr(settings, "TIMEOUT", 8))
+            else:
+                r = self.session.get(self.target, timeout=getattr(settings, "TIMEOUT", 8))
+            soup = BeautifulSoup(r.text, "lxml")
+            forms = soup.find_all("form")
+            login_like: List[Dict[str, Any]] = []
+            for form in forms:
+                inputs = {
+                    (inp.get("type", "text") or "text").lower(): (inp.get("name") or "").lower()
+                    for inp in form.find_all("input")
+                }
+                form_identifiers = " ".join([
+                    form.get("id", ""),
+                    form.get("name", ""),
+                    form.get("action", "")
+                ]).lower()
+                if "login" in form_identifiers or "signin" in form_identifiers or "password" in inputs:
+                    login_like.append({
+                        "method": (form.get("method") or "GET").upper(),
+                        "action": form.get("action") or "",
+                        "inputs": list(inputs.keys())
+                    })
+            return {
+                "ok": True,
+                "risk": "low" if not login_like else "medium",
+                "evidence": login_like,
+                "notes": f"{len(forms)} forms detected; brute-force disabled"
+            }
+        except requests.RequestException as e:
+            return {"ok": False, "risk": "low", "evidence": [], "notes": str(e)}

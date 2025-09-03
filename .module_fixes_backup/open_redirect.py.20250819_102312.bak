@@ -1,0 +1,117 @@
+from core import modules_base
+#!/usr/bin/env python3
+import requests
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, quote
+from typing import List, Dict, Any, Optional
+from core.modules.vulnerability_base import Scanner
+from config import settings
+
+class Scanner(modules_base.Scanner):
+    name: str = "open_redirect_probe"
+    risk: str = "low"
+    enabled: bool = True
+    timeout: int = getattr(settings, "TIMEOUT", 8)
+    user_agent: str = getattr(settings, "USER_AGENT", "QX-Scanner")
+    
+    REDIRECT_PARAMS: List[str] = [
+        "url", "redirect", "next", "continue", "return",
+        "dest", "destination", "go", "jump", "target",
+        "rurl", "forward", "redirect_url", "redirect_to"
+    ]
+
+    TEST_DOMAINS: List[str] = [
+        "https://evil.example.com",
+        "http://malicious.test",
+        "//attacker.com",
+        "https://google.com"  # For whitelist bypass testing
+    ]
+
+    def _configure_session(self) -> None:
+        if "User-Agent" not in self.session.headers:
+            self.session.headers.update({
+                "User-Agent": self.user_agent,
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "en-US,en"
+            })
+
+    def _build_test_cases(self) -> List[Dict[str, str]]:
+        parsed = urlparse(self.target)
+        queries = dict(parse_qsl(parsed.query))
+        test_cases = []
+
+        for param in queries:
+            if param.lower() in self.REDIRECT_PARAMS:
+                for domain in self.TEST_DOMAINS:
+                    new_query = queries.copy()
+                    new_query[param] = domain
+                    test_url = parsed._replace(query=urlencode(new_query, doseq=True))
+                    test_cases.append({
+                        "url": urlunparse(test_url),
+                        "param": param,
+                        "payload": domain,
+                        "vector": "query"
+                    })
+        
+        if not test_cases:
+            base_url = self.target.rstrip("/")
+            for param in self.REDIRECT_PARAMS[:3]:
+                for domain in self.TEST_DOMAINS[:2]:
+                    test_cases.append({
+                        "url": f"{base_url}?{param}={quote(domain)}",
+                        "param": param,
+                        "payload": domain,
+                        "vector": "query"
+                    })
+
+        return test_cases[:15]
+
+    def _execute_test(self, test_case: Dict[str, str]) -> Dict[str, Any]:
+        try:
+            response = self.session.get(
+                test_case["url"],
+                timeout=self.timeout,
+                allow_redirects=False,
+                proxies=getattr(self.session, "proxies", None)
+            )
+            
+            location = response.headers.get("Location", "")
+            vulnerable = any(
+                domain.lower() in location.lower()
+                for domain in self.TEST_DOMAINS
+            )
+            
+            return {
+                **test_case,
+                "status_code": response.status_code,
+                "location_header": location,
+                "vulnerable": vulnerable,
+                "content_length": len(response.content)
+            }
+        except requests.RequestException as e:
+            return {**test_case, "error": str(e)}
+
+    def scan(self) -> Dict[str, Any]:
+        self._configure_session()
+        evidence = []
+        vulnerable_count = 0
+
+        for test_case in self._build_test_cases():
+            result = self._execute_test(test_case)
+            evidence.append(result)
+            if result.get("vulnerable"):
+                vulnerable_count += 1
+
+        risk = "high" if vulnerable_count > 0 else "low"
+        return {
+            "ok": True,
+            "risk": risk,
+            "evidence": evidence,
+            "notes": f"Found {vulnerable_count} potential open redirect vulnerabilities",
+            "stats": {
+                "tests_performed": len(evidence),
+                "vulnerable_cases": vulnerable_count
+            }
+        }
+
+    def run(self) -> Dict[str, Any]:
+        return self.scan()

