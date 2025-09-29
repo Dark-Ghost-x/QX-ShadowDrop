@@ -6,29 +6,33 @@
 
  ## Installation Guide (Termux)
 
-To install QX-ShadowDrop on Termux:
-pkg update && pkg upgrade
+## To install QX-ShadowDrop on Termux:
+
+```  pkg update && pkg upgrade
 pkg install python git
 git clone https://github.com/Dark-Ghost-x/QX-ShadowDrop.git
 cd QX-ShadowDrop
-pip install -r requirements.txt
+pip install -r requirements.txt  ```
 
 ## Linux:
-sudo apt update && sudo apt upgrade
-sudo apt install python3 python3-pip git
 
-git clone https://github.com/Dark-Ghost-x/QX-ShadowDrop.git
+```  sudo apt update && sudo apt upgrade
+sudo apt install python3 python3-pip git  ```
+
+```  git clone https://github.com/Dark-Ghost-x/QX-ShadowDrop.git
 cd QX-ShadowDrop
-pip install -r requirements.txt
+pip install -r requirements.txt  ```
 
 ## How to Use the Tool
 ## Run all modules:
-python3 run.py -t https://example.com --stealth
+
+```  python3 run.py -t https://example.com --stealth  ```
 
 
  ## Note: Running all modules may take time (30 to 60 minutes depending on the target). It is recommended to run modules individually for faster and more focused results.
 ## Run a specific module:
-python3 run.py -t https://example.com -m headers --stealth
+
+``` python3 run.py -t https://example.com -m headers --stealth ```
 
 
  ## Available Modules
@@ -53,10 +57,11 @@ wayback_scraper
 
 
 ## To run a specific module:
-python3 run.py -t https://example.com -m <module_name> --stealth
+
+``` python3 run.py -t https://example.com -m <module_name> --stealth ```
 
 
- Execution Modes
+ ## Execution Modes
 
 
 
